@@ -153,7 +153,7 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 6)
             }
-            .buttonStyle(audio.isLive ? .glass : .glassProminent)
+            .buttonStyle(.glassProminent)
             .tint(audio.isLive ? .red : .green)
             .disabled(audio.isStarting)
 
