@@ -1,3 +1,4 @@
+import AVFAudio
 import Foundation
 
 struct SoundClip: Identifiable, Codable, Hashable {
@@ -51,9 +52,10 @@ final class SoundLibrary: ObservableObject {
             if scoped { sourceURL.stopAccessingSecurityScopedResource() }
         }
 
-        let ext = sourceURL.pathExtension.isEmpty ? "m4a" : sourceURL.pathExtension
+        try validatePlayableAudio(at: sourceURL)
+
         let id = UUID()
-        let fileName = id.uuidString + "." + ext
+        let fileName = storedFileName(id: id, sourceURL: sourceURL)
         let destination = soundsDirectory.appendingPathComponent(fileName)
 
         try replaceCopy(from: sourceURL, to: destination)
@@ -91,14 +93,19 @@ final class SoundLibrary: ObservableObject {
             if scoped { sourceURL.stopAccessingSecurityScopedResource() }
         }
 
-        if let oldFiles = try? fileManager.contentsOfDirectory(at: backingDirectory, includingPropertiesForKeys: nil) {
+        try validatePlayableAudio(at: sourceURL)
+
+        if let oldFiles = try? fileManager.contentsOfDirectory(
+            at: backingDirectory,
+            includingPropertiesForKeys: nil
+        ) {
             for oldFile in oldFiles {
                 try? fileManager.removeItem(at: oldFile)
             }
         }
 
-        let ext = sourceURL.pathExtension.isEmpty ? "mp3" : sourceURL.pathExtension
-        let fileName = "backing-" + UUID().uuidString + "." + ext
+        let id = UUID()
+        let fileName = "backing-" + storedFileName(id: id, sourceURL: sourceURL)
         let destination = backingDirectory.appendingPathComponent(fileName)
 
         try replaceCopy(from: sourceURL, to: destination)
@@ -118,6 +125,33 @@ final class SoundLibrary: ObservableObject {
         backingTrackName = nil
         UserDefaults.standard.removeObject(forKey: backingFileKey)
         UserDefaults.standard.removeObject(forKey: backingNameKey)
+    }
+
+    private func validatePlayableAudio(at url: URL) throws {
+        do {
+            let player = try AVAudioPlayer(contentsOf: url)
+            guard player.prepareToPlay(), player.duration > 0 else {
+                throw unsupportedAudioError()
+            }
+        } catch {
+            throw unsupportedAudioError()
+        }
+    }
+
+    private func unsupportedAudioError() -> NSError {
+        NSError(
+            domain: "LiveMic.Import",
+            code: 2,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Diese Datei kann von iOS nicht als Audio abgespielt werden. Bitte verwende z. B. MP3, M4A, WAV oder AIFF."
+            ]
+        )
+    }
+
+    private func storedFileName(id: UUID, sourceURL: URL) -> String {
+        let ext = sourceURL.pathExtension.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ext.isEmpty ? id.uuidString : id.uuidString + "." + ext.lowercased()
     }
 
     private func replaceCopy(from source: URL, to destination: URL) throws {

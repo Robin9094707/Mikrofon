@@ -32,13 +32,13 @@ struct ContentView: View {
         }
         .fileImporter(
             isPresented: $importingBacking,
-            allowedContentTypes: [.audio],
+            allowedContentTypes: [.data],
             allowsMultipleSelection: false,
             onCompletion: handleBackingImport
         )
         .fileImporter(
             isPresented: $importingSound,
-            allowedContentTypes: [.audio],
+            allowedContentTypes: [.data],
             allowsMultipleSelection: false,
             onCompletion: handleSoundImport
         )
@@ -116,6 +116,11 @@ struct ContentView: View {
                     Text(audio.outputDetail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    Text("Eingang: \(audio.inputName)")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
                 }
 
                 Spacer()
@@ -133,7 +138,7 @@ struct ContentView: View {
                 }
                 .font(.subheadline.weight(.semibold))
 
-                Slider(value: $audio.micGain, in: 0...1.5)
+                Slider(value: $audio.micGain, in: 0...1)
                     .tint(.green)
             }
 
@@ -157,10 +162,13 @@ struct ContentView: View {
             .tint(audio.isLive ? .red : .green)
             .disabled(audio.isStarting)
 
-            Text("Bluetooth-Lautsprecher funktionieren über A2DP. Bluetooth selbst kann hörbare Verzögerung verursachen.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Die Pegelanzeige muss beim Sprechen ausschlagen. Dann kommt dein Mikrofonsignal in der App an.")
+                Text("Bluetooth-Lautsprecher funktionieren über A2DP. Bluetooth selbst kann hörbare Verzögerung verursachen.")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .glassPanel()
     }

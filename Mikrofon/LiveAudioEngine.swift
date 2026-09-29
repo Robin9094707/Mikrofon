@@ -6,13 +6,16 @@ final class LiveAudioEngine: NSObject, ObservableObject {
     @Published private(set) var isLive = false
     @Published private(set) var isStarting = false
     @Published private(set) var micLevel: Double = 0
+    @Published private(set) var inputName = "iPhone-Mikrofon"
     @Published private(set) var outputName = "iPhone"
     @Published private(set) var outputDetail = "Interner Lautsprecher"
     @Published private(set) var isExternalOutput = false
     @Published private(set) var isBackingPlaying = false
 
     @Published var micGain: Double = 1.0 {
-        didSet { micMixer.outputVolume = Float(micGain) }
+        didSet {
+            engine.mainMixerNode.outputVolume = Float(min(max(micGain, 0), 1))
+        }
     }
 
     @Published var backingVolume: Double = 0.55 {
@@ -28,17 +31,18 @@ final class LiveAudioEngine: NSObject, ObservableObject {
 
     private let session = AVAudioSession.sharedInstance()
     private let engine = AVAudioEngine()
-    private let micMixer = AVAudioMixerNode()
     private var hasMicTap = false
+    private var recoveryPending = false
 
     private var backingPlayer: AVAudioPlayer?
     private var oneShotPlayers: [UUID: AVAudioPlayer] = [:]
+
     private var routeObserver: NSObjectProtocol?
+    private var engineConfigurationObserver: NSObjectProtocol?
     private var interruptionObserver: NSObjectProtocol?
 
     override init() {
         super.init()
-        engine.attach(micMixer)
 
         routeObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification,
@@ -46,7 +50,19 @@ final class LiveAudioEngine: NSObject, ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.refreshRoute()
+                guard let self else { return }
+                self.refreshRoute()
+                self.scheduleLiveGraphRecovery()
+            }
+        }
+
+        engineConfigurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.scheduleLiveGraphRecovery()
             }
         }
 
@@ -65,6 +81,7 @@ final class LiveAudioEngine: NSObject, ObservableObject {
 
     deinit {
         if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
+        if let engineConfigurationObserver { NotificationCenter.default.removeObserver(engineConfigurationObserver) }
         if let interruptionObserver { NotificationCenter.default.removeObserver(interruptionObserver) }
     }
 
@@ -79,6 +96,7 @@ final class LiveAudioEngine: NSObject, ObservableObject {
 
         Task {
             let granted = await AVAudioApplication.requestRecordPermission()
+
             guard granted else {
                 isStarting = false
                 errorMessage = "Mikrofonzugriff wurde nicht erlaubt. Bitte aktiviere ihn in den iOS-Einstellungen für Live Mic."
@@ -86,9 +104,16 @@ final class LiveAudioEngine: NSObject, ObservableObject {
             }
 
             do {
-                try startLive()
-            } catch {
+                try configureLiveSession()
+                try buildAndStartLiveGraph()
+
+                isLive = true
                 isStarting = false
+                refreshRoute()
+            } catch {
+                stopEngineGraph()
+                isStarting = false
+                isLive = false
                 errorMessage = "Live-Mikrofon konnte nicht gestartet werden: \(error.localizedDescription)"
             }
         }
@@ -100,18 +125,14 @@ final class LiveAudioEngine: NSObject, ObservableObject {
         isBackingPlaying = false
         oneShotPlayers.removeAll()
 
-        if hasMicTap {
-            engine.inputNode.removeTap(onBus: 0)
-            hasMicTap = false
-        }
+        stopEngineGraph()
 
-        engine.stop()
-        engine.disconnectNodeOutput(engine.inputNode)
-        engine.disconnectNodeOutput(micMixer)
         micLevel = 0
         isLive = false
         isStarting = false
+        recoveryPending = false
 
+        try? session.overrideOutputAudioPort(.none)
         try? session.setActive(false, options: .notifyOthersOnDeactivation)
         refreshRoute()
     }
@@ -135,7 +156,10 @@ final class LiveAudioEngine: NSObject, ObservableObject {
             player.volume = Float(backingVolume)
             player.numberOfLoops = backingLoops ? -1 : 0
             player.prepareToPlay()
-            player.play()
+
+            guard player.play() else {
+                throw audioError("Die Audiodatei konnte nicht gestartet werden.")
+            }
 
             backingPlayer = player
             isBackingPlaying = true
@@ -146,8 +170,7 @@ final class LiveAudioEngine: NSObject, ObservableObject {
 
     func restartBacking() {
         backingPlayer?.currentTime = 0
-        if backingPlayer != nil {
-            backingPlayer?.play()
+        if backingPlayer?.play() == true {
             isBackingPlaying = true
         }
     }
@@ -166,7 +189,11 @@ final class LiveAudioEngine: NSObject, ObservableObject {
             let player = try AVAudioPlayer(contentsOf: url)
             player.volume = Float(soundVolume)
             player.prepareToPlay()
-            player.play()
+
+            guard player.play() else {
+                throw audioError("Der Sound konnte nicht gestartet werden.")
+            }
+
             oneShotPlayers[id] = player
 
             let lifetime = max(player.duration + 0.5, 1.0)
@@ -183,6 +210,12 @@ final class LiveAudioEngine: NSObject, ObservableObject {
     }
 
     func refreshRoute() {
+        if let input = session.currentRoute.inputs.first {
+            inputName = input.portName
+        } else {
+            inputName = "iPhone-Mikrofon"
+        }
+
         guard let output = session.currentRoute.outputs.first else {
             outputName = "Keine Ausgabe"
             outputDetail = "Verbinde einen Lautsprecher oder Kopfhörer"
@@ -229,9 +262,7 @@ final class LiveAudioEngine: NSObject, ObservableObject {
         }
     }
 
-    private func startLive() throws {
-        isStarting = true
-
+    private func configureLiveSession() throws {
         try session.setCategory(
             .playAndRecord,
             mode: .default,
@@ -242,35 +273,50 @@ final class LiveAudioEngine: NSObject, ObservableObject {
         try? session.setPreferredIOBufferDuration(0.005)
         try session.setActive(true, options: .notifyOthersOnDeactivation)
 
+        // A2DP is output-only. Prefer the iPhone microphone while keeping
+        // a connected Bluetooth music speaker as the output route.
         if let builtInMic = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
             try? session.setPreferredInput(builtInMic)
         }
 
+        // playAndRecord can otherwise fall back to the quiet receiver.
+        if session.currentRoute.outputs.first?.portType == .builtInReceiver {
+            try? session.overrideOutputAudioPort(.speaker)
+        } else {
+            try? session.overrideOutputAudioPort(.none)
+        }
+
+        refreshRoute()
+    }
+
+    private func buildAndStartLiveGraph() throws {
+        stopEngineGraph()
+
         let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
+        let mainMixer = engine.mainMixerNode
+        let output = engine.outputNode
 
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw NSError(
-                domain: "LiveMic",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Kein verwendbares Mikrofon gefunden."]
-            )
+        let inputHardwareFormat = input.inputFormat(forBus: 0)
+        let outputHardwareFormat = output.outputFormat(forBus: 0)
+
+        guard inputHardwareFormat.sampleRate > 0,
+              inputHardwareFormat.channelCount > 0 else {
+            throw audioError("Das Mikrofon liefert aktuell kein verwendbares Audiosignal.")
         }
 
-        engine.disconnectNodeOutput(input)
-        engine.disconnectNodeOutput(micMixer)
-
-        engine.connect(input, to: micMixer, format: format)
-        engine.connect(micMixer, to: engine.mainMixerNode, format: nil)
-        micMixer.outputVolume = Float(micGain)
-
-        if hasMicTap {
-            input.removeTap(onBus: 0)
-            hasMicTap = false
+        guard outputHardwareFormat.sampleRate > 0,
+              outputHardwareFormat.channelCount > 0 else {
+            throw audioError("Die ausgewählte Audioausgabe ist aktuell nicht verfügbar.")
         }
 
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+        // Keep connection and tap formats nil so AVAudioEngine can follow
+        // Bluetooth/sample-rate changes instead of holding stale hardware formats.
+        engine.connect(input, to: mainMixer, format: nil)
+        mainMixer.outputVolume = Float(min(max(micGain, 0), 1))
+
+        input.installTap(onBus: 0, bufferSize: 512, format: nil) { [weak self] buffer, _ in
             guard let channel = buffer.floatChannelData?.pointee else { return }
+
             let frameCount = Int(buffer.frameLength)
             guard frameCount > 0 else { return }
 
@@ -293,20 +339,57 @@ final class LiveAudioEngine: NSObject, ObservableObject {
         engine.prepare()
         try engine.start()
 
-        isLive = true
-        isStarting = false
-        refreshRoute()
+        guard engine.isRunning else {
+            throw audioError("Die Audio-Engine wurde gestartet, läuft aber nicht.")
+        }
+    }
+
+    private func stopEngineGraph() {
+        if hasMicTap {
+            engine.inputNode.removeTap(onBus: 0)
+            hasMicTap = false
+        }
+
+        engine.stop()
+        engine.disconnectNodeOutput(engine.inputNode)
+    }
+
+    private func scheduleLiveGraphRecovery() {
+        guard isLive, !isStarting, !recoveryPending else { return }
+
+        recoveryPending = true
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+
+                self.recoveryPending = false
+                guard self.isLive, !self.isStarting else { return }
+
+                self.isStarting = true
+
+                do {
+                    try self.configureLiveSession()
+                    try self.buildAndStartLiveGraph()
+                    self.isStarting = false
+                    self.refreshRoute()
+                } catch {
+                    self.stopEngineGraph()
+                    self.isLive = false
+                    self.isStarting = false
+                    self.micLevel = 0
+                    self.errorMessage = "Audioausgabe hat sich geändert und Live Mic konnte nicht neu verbunden werden: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     private func activateSessionForPlayback() throws {
         if !isLive {
-            try session.setCategory(
-                .playAndRecord,
-                mode: .default,
-                options: [.allowBluetoothA2DP, .allowAirPlay, .defaultToSpeaker]
-            )
+            try session.setCategory(.playback, mode: .default, options: [.allowAirPlay])
             try session.setActive(true)
         }
+
         refreshRoute()
     }
 
@@ -315,12 +398,19 @@ final class LiveAudioEngine: NSObject, ObservableObject {
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
 
         if type == .began {
-            if engine.isRunning {
-                engine.pause()
-            }
+            stopEngineGraph()
             isLive = false
+            isStarting = false
             isBackingPlaying = false
             micLevel = 0
         }
+    }
+
+    private func audioError(_ message: String) -> NSError {
+        NSError(
+            domain: "LiveMic.Audio",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
     }
 }

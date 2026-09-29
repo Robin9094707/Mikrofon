@@ -29,3 +29,11 @@ Die GitHub Action erzeugt ein unsigned IPA. Für direkte Installation auf einem 
 ## Hinweis zu Bluetooth
 
 Bluetooth-Audio hat technisch bedingte Latenz. Die App minimiert die lokale Audio-Pipeline, kann aber die zusätzliche Latenz eines Bluetooth-Lautsprechers nicht entfernen.
+
+## 1.0.1
+
+- Live-Mikrofon-Graph auf direkte InputNode → MainMixer → Output-Ausgabe umgestellt
+- automatischer Neuaufbau der Audio-Engine bei Bluetooth-/Route-Wechsel
+- Audioformate folgen der aktiven Hardware-Route automatisch
+- Dateipicker lässt Dateien breit auswählen und validiert Audio anschließend
+- MP3/M4A/WAV/AIFF-Import robuster
