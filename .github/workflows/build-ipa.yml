@@ -1,0 +1,84 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: Install XcodeGen
+        run: |
+          brew update
+          brew install xcodegen
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate
+          xcodebuild -list -project Mikrofon.xcodeproj
+
+      - name: Build app for iPhone
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Mikrofon.xcodeproj \
+            -scheme Mikrofon \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Package IPA
+        run: |
+          set -e
+          APP_PATH="$(find "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos" -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          if [ -z "$APP_PATH" ]; then
+            echo 'No .app bundle found.'
+            exit 1
+          fi
+
+          rm -rf build/Payload
+          mkdir -p build/Payload
+          cp -R "$APP_PATH" build/Payload/
+
+          cd build
+          /usr/bin/zip -qry LiveMic-unsigned.ipa Payload
+          ls -lh LiveMic-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveMic-IPA
+          path: build/LiveMic-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
